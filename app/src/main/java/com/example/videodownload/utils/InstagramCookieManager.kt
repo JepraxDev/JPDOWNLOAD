@@ -20,6 +20,24 @@ object InstagramCookieManager {
         return file.exists() && file.length() > 50
     }
 
+    // Devuelve las cookies guardadas como header "k=v; k2=v2" o null si no hay
+    fun getCookieHeader(context: Context): String? {
+        val file = getCookieFile(context)
+        if (!file.exists()) return null
+        return try {
+            val pairs = file.readLines()
+                .filter { !it.startsWith("#") && it.isNotBlank() }
+                .mapNotNull { line ->
+                    val parts = line.split("\t")
+                    if (parts.size >= 7) "${parts[5]}=${parts[6]}" else null
+                }
+            if (pairs.isNotEmpty()) pairs.joinToString("; ") else null
+        } catch (e: Exception) {
+            Log.w(TAG, "[getCookieHeader] Error leyendo cookies: ${e.message}")
+            null
+        }
+    }
+
     fun saveCookiesFromWebView(context: Context): Boolean {
         try {
             val cookieString = CookieManager.getInstance().getCookie("https://www.instagram.com")

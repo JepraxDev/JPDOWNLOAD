@@ -399,6 +399,23 @@ class AndroidVideoDownloader(private val context: Context) {
             .addRequestHeader("Referer", referer)
             .addRequestHeader("Origin", origin)
 
+        // Imágenes (carruseles de TikTok sin marca de agua)
+        if (ext == "jpg" || ext == "jpeg" || ext == "png" || ext == "webp") {
+            val mime = when (ext) {
+                "png" -> "image/png"
+                "webp" -> "image/webp"
+                else -> "image/jpeg"
+            }
+            request.setMimeType(mime)
+            request.setDestinationInExternalPublicDir(
+                Environment.DIRECTORY_PICTURES,
+                "VideoDownload/$fileName"
+            )
+            val downloadId = downloadManager.enqueue(request)
+            Log.i(TAG, "[downloadMedia] Imagen encolada en Pictures/VideoDownload/$fileName | ID: $downloadId")
+            return downloadId
+        }
+
         if (option.isAudio || ext == "mp3" || ext == "m4a" || ext == "webm") {
             val mime = when (ext) {
                 "mp3" -> "audio/mpeg"

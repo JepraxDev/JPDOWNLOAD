@@ -79,7 +79,7 @@ class VideoExtractorRepository(private val context: Context) {
         listOf(
             TikTokExtractor(client),
             TwitterExtractor(client, context),
-            InstagramExtractor(context),
+            InstagramExtractor(client, context),
             FacebookExtractor(client, context),
             YouTubeExtractor(client, context)
         )
@@ -179,6 +179,48 @@ class TikTokExtractor(private val client: OkHttpClient) : PlatformExtractor {
                     val author = authorObj?.get("nickname")?.asString
                         ?: authorObj?.get("unique_id")?.asString
                         ?: "TikTok User"
+
+                    // Publicaciones tipo carrusel de fotos (sin marca de agua)
+                    val imagesArr = data.getAsJsonArray("images")
+                    if (imagesArr != null && imagesArr.size() > 0) {
+                        val imageUrls = mutableListOf<String>()
+                        for (i in 0 until imagesArr.size()) {
+                            val imgUrl = imagesArr.get(i)?.asString ?: continue
+                            if (imgUrl.isNotBlank()) imageUrls.add(imgUrl)
+                        }
+
+                        if (imageUrls.isNotEmpty()) {
+                            // Una opción de descarga por cada imagen
+                            val options = mutableListOf<DownloadOption>()
+                            imageUrls.forEachIndexed { idx, imgUrl ->
+                                options.add(
+                                    DownloadOption(
+                                        label = if (imageUrls.size == 1) "Imagen (sin marca de agua)"
+                                        else "Imagen ${idx + 1} de ${imageUrls.size} (sin marca de agua)",
+                                        downloadUrl = imgUrl,
+                                        isAudio = false,
+                                        quality = "HD",
+                                        extension = "jpg"
+                                    )
+                                )
+                            }
+
+                            val videoInfo = VideoInfo(
+                                id = id,
+                                title = title,
+                                author = author,
+                                thumbnailUrl = cover,
+                                downloadUrl = imageUrls.first(),
+                                platform = Platform.TIKTOK,
+                                quality = "Imágenes sin marca de agua",
+                                isWatermarkFree = true,
+                                originalUrl = url,
+                                options = options
+                            )
+                            Log.i(VideoExtractorRepository.TAG, "[TikTokExtractor] ÉXITO (carrusel) -> ${imageUrls.size} imágenes")
+                            return Result.success(videoInfo)
+                        }
+                    }
 
                     val options = mutableListOf(
                         DownloadOption("Full HD (1080p)", playUrl, isAudio = false, quality = "1080p", extension = "mp4"),
@@ -1027,7 +1069,10 @@ class YouTubeExtractor(
 // ============================================================================
 // EXTRACTOR MODULAR DE INSTAGRAM (100% Local Ejecutable Nativo con youtubedl-android)
 // ============================================================================
-class InstagramExtractor(private val context: Context) : PlatformExtractor {
+class InstagramExtractor(
+    private val client: OkHttpClient,
+    private val context: Context
+) : PlatformExtractor {
     override val platform = Platform.INSTAGRAM
 
     companion object {
@@ -1062,105 +1107,377 @@ class InstagramExtractor(private val context: Context) : PlatformExtractor {
         val canonicalUrl = if (!shortcode.isNullOrBlank()) "https://www.instagram.com/reel/$shortcode/" else cleanUrl
 
         Log.d(VideoExtractorRepository.TAG, "==================================================")
-        Log.d(VideoExtractorRepository.TAG, "[InstagramExtractor] Ejecutando Local Native yt-dlp Executable Engine...")
         Log.d(VideoExtractorRepository.TAG, "[InstagramExtractor] URL: '$canonicalUrl' | Shortcode: '$shortcode'")
 
-        var isRetryAfterUpdate = false
-        while (true) {
-            try {
-                val request = YoutubeDLRequest(canonicalUrl)
-                request.addOption("--dump-json")
-                request.addOption("--no-playlist")
-                request.addOption("--user-agent", USER_AGENT)
+        // --------------------------------------------------------------------
+        // MÉTODO 1: API interna de Instagram (x-ig-app-id), sin login, sin yt-dlp
+        // --------------------------------------------------------------------
+        if (!shortcode.isNullOrBlank()) {
+            val apiResult = extractViaInternalApi(shortcode)
+            if (apiResult != null) {
+                Log.i(VideoExtractorRepository.TAG, "[InstagramExtractor] API interna ÉXITO -> ${apiResult.videoUrl}")
+                return@withContext Result.success(
+                    VideoInfo(
+                        id = shortcode,
+                        title = apiResult.title,
+                        author = apiResult.author,
+                        thumbnailUrl = apiResult.thumb,
+                        downloadUrl = apiResult.videoUrl,
+                        platform = Platform.INSTAGRAM,
+                        quality = "1080p Full HD",
+                        isWatermarkFree = true,
+                        originalUrl = url,
+                        options = listOf(
+                            DownloadOption("Full HD (1080p)", apiResult.videoUrl, isAudio = false, quality = "1080p", extension = "mp4"),
+                            DownloadOption("HD (720p)", apiResult.videoUrl, isAudio = false, quality = "720p", extension = "mp4"),
+                            DownloadOption("Audio MP3", apiResult.videoUrl, isAudio = true, quality = "MP3", extension = "mp3")
+                        )
+                    )
+                )
+            }
 
-                // Cargar cookies privadas del almacenamiento interno si el usuario inició sesión
-                val cookieFile = InstagramCookieManager.getCookieFile(context)
-                if (InstagramCookieManager.hasCookies(context)) {
-                    Log.i(VideoExtractorRepository.TAG, "[InstagramExtractor] Cargando cookies de Instagram desde almacenamiento privado: ${cookieFile.absolutePath}")
-                    request.addOption("--cookies", cookieFile.absolutePath)
-                } else {
-                    Log.d(VideoExtractorRepository.TAG, "[InstagramExtractor] No hay cookies privadas guardadas. Ejecutando extracción anónima.")
+            // ----------------------------------------------------------------
+            // MÉTODO 2: Embed público de Instagram
+            // ----------------------------------------------------------------
+            val embedResult = extractViaEmbed(shortcode)
+            if (embedResult != null) {
+                Log.i(VideoExtractorRepository.TAG, "[InstagramExtractor] Embed ÉXITO -> ${embedResult.first}")
+                val (videoUrl, thumb) = embedResult
+                return@withContext Result.success(
+                    VideoInfo(
+                        id = shortcode,
+                        title = "Instagram Reel $shortcode",
+                        author = "Instagram User",
+                        thumbnailUrl = thumb,
+                        downloadUrl = videoUrl,
+                        platform = Platform.INSTAGRAM,
+                        quality = "1080p Full HD",
+                        isWatermarkFree = true,
+                        originalUrl = url,
+                        options = listOf(
+                            DownloadOption("Full HD (1080p)", videoUrl, isAudio = false, quality = "1080p", extension = "mp4"),
+                            DownloadOption("HD (720p)", videoUrl, isAudio = false, quality = "720p", extension = "mp4"),
+                            DownloadOption("Audio MP3", videoUrl, isAudio = true, quality = "MP3", extension = "mp3")
+                        )
+                    )
+                )
+            }
+        }
+
+        // --------------------------------------------------------------------
+        // MÉTODO 2: yt-dlp (último recurso; no se auto-actualiza: el Python
+        // empaquetado es 3.8 y las versiones nuevas de yt-dlp no son compatibles)
+        // --------------------------------------------------------------------
+        try {
+            val request = YoutubeDLRequest(canonicalUrl)
+            request.addOption("--dump-json")
+            request.addOption("--no-playlist")
+            request.addOption("--user-agent", USER_AGENT)
+
+            // Cargar cookies privadas del almacenamiento interno si el usuario inició sesión
+            val cookieFile = InstagramCookieManager.getCookieFile(context)
+            if (InstagramCookieManager.hasCookies(context)) {
+                Log.i(VideoExtractorRepository.TAG, "[InstagramExtractor] Cargando cookies de Instagram: ${cookieFile.absolutePath}")
+                request.addOption("--cookies", cookieFile.absolutePath)
+            } else {
+                Log.d(VideoExtractorRepository.TAG, "[InstagramExtractor] Sin cookies guardadas. Extracción anónima.")
+            }
+
+            val response = YoutubeDL.getInstance().execute(request)
+            val outJson = response.out ?: ""
+
+            if (outJson.isNotBlank() && outJson.startsWith("{")) {
+                val json = JsonParser.parseString(outJson).asJsonObject
+
+                var directVideoUrl = json.get("url")?.asString ?: ""
+                if (directVideoUrl.isBlank() && json.has("requested_formats")) {
+                    val formats = json.getAsJsonArray("requested_formats")
+                    if (formats != null && formats.size() > 0) {
+                        directVideoUrl = formats.get(0).asJsonObject.get("url")?.asString ?: ""
+                    }
                 }
 
-                Log.d(VideoExtractorRepository.TAG, "[InstagramExtractor] Ejecutando YoutubeDL.getInstance().execute()...")
-                val response = YoutubeDL.getInstance().execute(request)
-                val outJson = response.out ?: ""
+                val title = json.get("title")?.asString?.takeIf { it.isNotBlank() } ?: "Instagram Reel"
+                val author = json.get("uploader")?.asString ?: json.get("uploader_id")?.asString ?: "Instagram User"
+                val thumb = json.get("thumbnail")?.asString ?: ""
 
-                if (outJson.isNotBlank() && outJson.startsWith("{")) {
-                    val json = JsonParser.parseString(outJson).asJsonObject
+                if (directVideoUrl.isNotBlank() && directVideoUrl.startsWith("http")) {
+                    val options = listOf(
+                        DownloadOption("Full HD (1080p)", directVideoUrl, isAudio = false, quality = "1080p", extension = "mp4"),
+                        DownloadOption("HD (720p)", directVideoUrl, isAudio = false, quality = "720p", extension = "mp4"),
+                        DownloadOption("Audio MP3", directVideoUrl, isAudio = true, quality = "MP3", extension = "mp3")
+                    )
 
-                    var directVideoUrl = json.get("url")?.asString ?: ""
-                    if (directVideoUrl.isBlank() && json.has("requested_formats")) {
-                        val formats = json.getAsJsonArray("requested_formats")
-                        if (formats != null && formats.size() > 0) {
-                            directVideoUrl = formats.get(0).asJsonObject.get("url")?.asString ?: ""
+                    Log.i(VideoExtractorRepository.TAG, "[InstagramExtractor] Native yt-dlp ÉXITO -> $directVideoUrl")
+                    return@withContext Result.success(
+                        VideoInfo(
+                            id = shortcode ?: System.currentTimeMillis().toString(),
+                            title = title,
+                            author = author,
+                            thumbnailUrl = thumb,
+                            downloadUrl = directVideoUrl,
+                            platform = Platform.INSTAGRAM,
+                            quality = "1080p Full HD",
+                            isWatermarkFree = true,
+                            originalUrl = url,
+                            options = options
+                        )
+                    )
+                }
+            }
+        } catch (e: Exception) {
+            val errorMsg = e.message ?: ""
+            Log.e(VideoExtractorRepository.TAG, "[InstagramExtractor] Excepción Native yt-dlp: $errorMsg", e)
+
+            // NO auto-actualizar: las versiones nuevas de yt-dlp no soportan el
+            // Python 3.8 empaquetado y la actualización deja el motor inservible.
+            if (errorMsg.contains("unsupported version of Python", ignoreCase = true) ||
+                errorMsg.contains("Only Python versions 3.11", ignoreCase = true)
+            ) {
+                Log.w(VideoExtractorRepository.TAG, "[InstagramExtractor] yt-dlp incompatible con el Python empaquetado. Omitiendo.")
+            }
+
+            val userError = when {
+                errorMsg.contains("Private", ignoreCase = true) || errorMsg.contains("login", ignoreCase = true) ->
+                    "El Reel o publicación de Instagram es privado o requiere inicio de sesión."
+                errorMsg.contains("404", ignoreCase = true) || errorMsg.contains("not found", ignoreCase = true) ->
+                    "El Reel de Instagram fue eliminado o el enlace no es válido."
+                errorMsg.contains("429", ignoreCase = true) || errorMsg.contains("rate limit", ignoreCase = true) ->
+                    "Límite de peticiones excedido en Instagram. Intenta más tarde."
+                else ->
+                    "No se pudo extraer el video de Instagram. Verifica que la publicación sea pública."
+            }
+
+            return@withContext Result.failure(Exception(userError))
+        }
+
+        return@withContext Result.failure(Exception("No se pudo extraer el Reel de Instagram. Verifica que sea público."))
+    }
+
+    /**
+     * Extrae el video vía la API interna de Instagram (no requiere login para
+     * posts públicos). Convierte el shortcode al media id numérico y consulta
+     * /api/v1/media/{id}/info/ con el app-id oficial de la web de Instagram.
+     */
+    private data class InstaApiResult(
+        val videoUrl: String,
+        val thumb: String,
+        val title: String,
+        val author: String
+    )
+
+    private fun shortcodeToMediaId(shortcode: String): Long {
+        val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
+        var id = 0L
+        for (c in shortcode) {
+            val idx = alphabet.indexOf(c)
+            if (idx < 0) return -1L
+            id = id * 64 + idx
+        }
+        return id
+    }
+
+    private fun extractViaInternalApi(shortcode: String): InstaApiResult? {
+        val mediaId = shortcodeToMediaId(shortcode)
+        if (mediaId <= 0) return null
+
+        val apiUrls = listOf(
+            "https://www.instagram.com/api/v1/media/$mediaId/info/",
+            "https://i.instagram.com/api/v1/media/$mediaId/info/"
+        )
+
+        val cookieHeader = InstagramCookieManager.getCookieHeader(context)
+
+        for (apiUrl in apiUrls) {
+            try {
+                val requestBuilder = Request.Builder()
+                    .url(apiUrl)
+                    .addHeader("User-Agent", USER_AGENT)
+                    .addHeader("x-ig-app-id", "936619743392459")
+                    .addHeader("X-IG-App-ID", "936619743392459")
+                    .addHeader("X-ASBD-ID", "129477")
+                    .addHeader("X-Requested-With", "XMLHttpRequest")
+                    .addHeader("Accept", "application/json")
+                    .addHeader("Accept-Language", "es-ES,es;q=0.9,en;q=0.8")
+                    .addHeader("Referer", "https://www.instagram.com/reel/$shortcode/")
+
+                // Con sesión iniciada, Instagram ya no redirige a /accounts/login/
+                if (!cookieHeader.isNullOrBlank()) {
+                    Log.i(VideoExtractorRepository.TAG, "[InstagramExtractor] API interna usando cookies de sesión guardadas")
+                    requestBuilder.addHeader("Cookie", cookieHeader)
+                }
+
+                val request = requestBuilder.get().build()
+
+                client.newCall(request).execute().use { response ->
+                    val code = response.code
+                    val bodyString = response.body?.string() ?: ""
+                    Log.d(VideoExtractorRepository.TAG, "[InstagramExtractor] API interna HTTP $code | ${bodyString.length} bytes")
+                    if (!response.isSuccessful || bodyString.isBlank()) return@use
+                    if (!bodyString.trimStart().startsWith("{")) {
+                        // Instagram devolvió HTML/página en vez de JSON: registrar muestra para diagnóstico
+                        Log.w(VideoExtractorRepository.TAG, "[InstagramExtractor] API interna NO devolvió JSON. Muestra: ${bodyString.take(600)}")
+                        return@use
+                    }
+
+                    val json = try {
+                        JsonParser.parseString(bodyString).asJsonObject
+                    } catch (_: Exception) {
+                        return@use
+                    }
+
+                    var items = json.getAsJsonArray("items")
+                    if (items == null && json.has("data")) {
+                        val data = json.getAsJsonObject("data")
+                        items = data?.getAsJsonArray("items")
+                    }
+                    if (items == null || items.size() == 0) {
+                        Log.d(VideoExtractorRepository.TAG, "[InstagramExtractor] API sin 'items' en la respuesta")
+                        return@use
+                    }
+
+                    val item = items.get(0).asJsonObject
+                    var videoUrl = ""
+                    var bestWidth = 0
+
+                    // video_versions ordenadas por ancho (mayor = mejor calidad)
+                    val versions = item.getAsJsonArray("video_versions")
+                    if (versions != null) {
+                        for (i in 0 until versions.size()) {
+                            val v = versions.get(i).asJsonObject
+                            val vUrl = v.get("url")?.asString ?: continue
+                            val w = if (v.has("width") && !v.get("width").isJsonNull) v.get("width").asInt else 0
+                            if (vUrl.startsWith("http") && w >= bestWidth) {
+                                videoUrl = vUrl
+                                bestWidth = w
+                            }
                         }
                     }
 
-                    val title = json.get("title")?.asString?.takeIf { it.isNotBlank() } ?: "Instagram Reel"
-                    val author = json.get("uploader")?.asString ?: json.get("uploader_id")?.asString ?: "Instagram User"
-                    val thumb = json.get("thumbnail")?.asString ?: ""
+                    // Miniatura: la de mayor resolución de image_versions2
+                    var thumb = ""
+                    var bestThumbWidth = 0
+                    val imageCandidates = item.getAsJsonObject("image_versions2")?.getAsJsonArray("candidates")
+                    if (imageCandidates != null) {
+                        for (i in 0 until imageCandidates.size()) {
+                            val c = imageCandidates.get(i).asJsonObject
+                            val cUrl = c.get("url")?.asString ?: continue
+                            val w = if (c.has("width") && !c.get("width").isJsonNull) c.get("width").asInt else 0
+                            if (cUrl.startsWith("http") && w >= bestThumbWidth) {
+                                thumb = cUrl
+                                bestThumbWidth = w
+                            }
+                        }
+                    }
 
-                    if (directVideoUrl.isNotBlank() && directVideoUrl.startsWith("http")) {
-                        val options = listOf(
-                            DownloadOption("Full HD (1080p)", directVideoUrl, isAudio = false, quality = "1080p", extension = "mp4"),
-                            DownloadOption("HD (720p)", directVideoUrl, isAudio = false, quality = "720p", extension = "mp4"),
-                            DownloadOption("Audio MP3", directVideoUrl, isAudio = true, quality = "MP3", extension = "mp3")
-                        )
+                    val caption = item.getAsJsonObject("caption")
+                    val title = caption?.get("title")?.asString?.takeIf { !it.isNullOrBlank() }
+                        ?: item.get("title")?.asString?.takeIf { !it.isNullOrBlank() }
+                        ?: "Instagram Reel"
+                    val author = item.getAsJsonObject("user")?.get("username")?.asString
+                        ?: "Instagram User"
 
-                        Log.i(VideoExtractorRepository.TAG, "[InstagramExtractor] Native yt-dlp ÉXITO -> $directVideoUrl")
-                        return@withContext Result.success(
-                            VideoInfo(
-                                id = shortcode ?: System.currentTimeMillis().toString(),
-                                title = title,
-                                author = author,
-                                thumbnailUrl = thumb,
-                                downloadUrl = directVideoUrl,
-                                platform = Platform.INSTAGRAM,
-                                quality = "1080p Full HD",
-                                isWatermarkFree = true,
-                                originalUrl = url,
-                                options = options
-                            )
-                        )
+                    if (videoUrl.isNotBlank()) {
+                        return InstaApiResult(videoUrl, thumb, title, author)
                     }
                 }
             } catch (e: Exception) {
-                val errorMsg = e.message ?: ""
-                Log.e(VideoExtractorRepository.TAG, "[InstagramExtractor] Excepción Native yt-dlp: $errorMsg", e)
-
-                // Si no hemos intentado actualizar yt-dlp y es un error de extractor/firma
-                if (!isRetryAfterUpdate && (errorMsg.contains("ExtractorError") || errorMsg.contains("signature") || errorMsg.contains("update") || errorMsg.contains("HTTP Error"))) {
-                    isRetryAfterUpdate = true
-                    try {
-                        Log.w(VideoExtractorRepository.TAG, "[InstagramExtractor] Fallo de extractor. Intentando actualización automática de yt-dlp (YoutubeDL.updateYoutubeDL)...")
-                        YoutubeDL.getInstance().updateYoutubeDL(context)
-                        Log.i(VideoExtractorRepository.TAG, "[InstagramExtractor] yt-dlp actualizado con éxito. Reintentando extracción...")
-                        continue
-                    } catch (updateEx: Exception) {
-                        Log.e(VideoExtractorRepository.TAG, "[InstagramExtractor] Error actualizando yt-dlp: ${updateEx.message}")
-                    }
-                }
-
-                // Mapeo concreto de errores
-                val userError = when {
-                    errorMsg.contains("Private", ignoreCase = true) || errorMsg.contains("login", ignoreCase = true) ->
-                        "El Reel o publicación de Instagram es privado o requiere inicio de sesión."
-                    errorMsg.contains("404", ignoreCase = true) || errorMsg.contains("not found", ignoreCase = true) ->
-                        "El Reel de Instagram fue eliminado o el enlace no es válido."
-                    errorMsg.contains("429", ignoreCase = true) || errorMsg.contains("rate limit", ignoreCase = true) ->
-                        "Límite de peticiones excedido en Instagram."
-                    else ->
-                        "Error de extracción en Instagram: ${e.localizedMessage}"
-                }
-
-                return@withContext Result.failure(Exception(userError))
+                Log.w(VideoExtractorRepository.TAG, "[InstagramExtractor] Excepción en API interna '$apiUrl': ${e.message}")
             }
-
-            break
         }
 
-        return@withContext Result.failure(Exception("No se pudo extraer el Reel de Instagram."))
+        return null
+    }
+
+    /**
+     * Extrae el video de un reel público usando la página de embed de Instagram,
+     * que expone la URL del mp4 sin necesidad de iniciar sesión.
+     * Devuelve (videoUrl, thumbnailUrl) o null si no se encontró.
+     */
+    private fun extractViaEmbed(shortcode: String): Pair<String, String>? {
+        val embedUrls = listOf(
+            "https://www.instagram.com/reel/$shortcode/embed/captioned/",
+            "https://www.instagram.com/p/$shortcode/embed/captioned/"
+        )
+
+        for (embedUrl in embedUrls) {
+            try {
+                val requestBuilder = Request.Builder()
+                    .url(embedUrl)
+                    .addHeader("User-Agent", USER_AGENT)
+                    .addHeader("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                    .addHeader("Accept-Language", "es-ES,es;q=0.9,en;q=0.8")
+
+                val cookieHeader = InstagramCookieManager.getCookieHeader(context)
+                if (!cookieHeader.isNullOrBlank()) {
+                    requestBuilder.addHeader("Cookie", cookieHeader)
+                }
+
+                val request = requestBuilder.get().build()
+
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) return@use
+                    val html = response.body?.string() ?: return@use
+                    if (html.length < 500) return@use
+
+                    Log.d(VideoExtractorRepository.TAG, "[InstagramExtractor] Embed HTTP ${response.code} | ${html.length} bytes | contiene og:video=${html.contains("og:video")} | video_url=${html.contains("video_url")} | tag video=${html.contains("<video")} | login=${html.contains("login")}")
+                    Log.d(VideoExtractorRepository.TAG, "[InstagramExtractor] Embed MUESTRA: ${html.take(800)}")
+
+                    // 1. og:video / og:video:secure_url en meta tags
+                    var videoUrl: String? = null
+                    val ogMatcher = Pattern.compile(
+                        "<meta\\s+property=[\"']og:video(?::secure_url)?[\"']\\s+content=[\"']([^\"']+)[\"']",
+                        Pattern.CASE_INSENSITIVE
+                    ).matcher(html)
+                    while (ogMatcher.find()) {
+                        val candidate = ogMatcher.group(1)
+                        if (candidate != null && candidate.contains(".mp4")) {
+                            videoUrl = candidate
+                            break
+                        }
+                    }
+
+                    // 2. "video_url":"..." en el JSON embebido del HTML
+                    if (videoUrl == null) {
+                        val m = Pattern.compile("[\"']video_url[\"']\\s*:\\s*[\"']([^\"']+)[\"']").matcher(html)
+                        val v = if (m.find()) m.group(1) else null
+                        if (v != null) videoUrl = v.replace("\\u0026", "&").replace("\\/", "/")
+                    }
+
+                    // 3. "src":"..." de la etiqueta <video> del embed
+                    if (videoUrl == null) {
+                        val m = Pattern.compile("<video[^>]+src=[\"']([^\"']+)[\"']").matcher(html)
+                        val v = if (m.find()) m.group(1) else null
+                        if (v != null) videoUrl = v.replace("\\u0026", "&").replace("\\/", "/")
+                    }
+
+                    // 4. cualquier mp4 en atributos content como fallback
+                    if (videoUrl == null) {
+                        val m = Pattern.compile(
+                            "content=[\"'](https?://[^\"']+\\.mp4[^\"']*)[\"']",
+                            Pattern.CASE_INSENSITIVE
+                        ).matcher(html)
+                        if (m.find()) videoUrl = m.group(1)
+                    }
+
+                    // Miniatura del embed
+                    var thumb = ""
+                    val thumbMatcher = Pattern.compile(
+                        "<meta\\s+property=[\"']og:image[\"']\\s+content=[\"']([^\"']+)[\"']",
+                        Pattern.CASE_INSENSITIVE
+                    ).matcher(html)
+                    if (thumbMatcher.find()) thumb = thumbMatcher.group(1) ?: ""
+
+                    if (videoUrl != null && videoUrl.startsWith("http")) {
+                        return videoUrl to thumb
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(VideoExtractorRepository.TAG, "[InstagramExtractor] Excepción en embed '$embedUrl': ${e.message}")
+            }
+        }
+
+        return null
     }
 }
 

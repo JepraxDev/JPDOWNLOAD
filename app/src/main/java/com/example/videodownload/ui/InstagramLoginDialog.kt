@@ -93,9 +93,40 @@ fun InstagramLoginDialog(
                                 settings.userAgentString = "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.119 Mobile Safari/537.36"
 
                                 webViewClient = object : WebViewClient() {
+                                    // Instagram intenta "secuestrar" la sesión hacia su app
+                                    // (l.instagram.com / fall_back_to_web=false). Interceptar
+                                    // esos saltos y forzar el flujo web de inicio de sesión.
+                                    private fun handleUrl(view: WebView?, url: String?): Boolean {
+                                        if (view == null || url == null) return false
+
+                                        val isAppHijack = url.contains("l.instagram.com") ||
+                                            url.contains("fall_back_to_web=false") ||
+                                            url.startsWith("instagram://") ||
+                                            url.contains("utm_source=instagramweb")
+
+                                        if (isAppHijack) {
+                                            Log.d("InstagramLogin", "[WebView] Redirección a app interceptada: ${url.take(120)}")
+                                            view.loadUrl("https://www.instagram.com/accounts/login/")
+                                            return true
+                                        }
+                                        return false
+                                    }
+
+                                    override fun shouldOverrideUrlLoading(
+                                        view: WebView?,
+                                        request: WebResourceRequest?
+                                    ): Boolean {
+                                        return handleUrl(view, request?.url?.toString())
+                                    }
+
+                                    @Deprecated("Deprecated in Java")
+                                    override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean {
+                                        return handleUrl(view, url)
+                                    }
+
                                     override fun onPageFinished(view: WebView?, url: String?) {
                                         super.onPageFinished(view, url)
-                                        if (url != null && (url.contains("instagram.com") || url.contains("feed"))) {
+                                        if (url != null && url.contains("instagram.com") && !url.contains("accounts/login")) {
                                             val saved = InstagramCookieManager.saveCookiesFromWebView(ctx)
                                             if (saved) {
                                                 onSuccessLogin()
