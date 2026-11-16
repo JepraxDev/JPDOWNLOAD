@@ -5,11 +5,13 @@ import android.content.Context
 import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Environment
+import android.provider.DocumentsContract
 import android.util.Log
 import com.example.videodownload.data.model.DownloadOption
 import com.example.videodownload.data.model.Platform
 import com.example.videodownload.data.model.VideoInfo
 import com.example.videodownload.data.repository.VideoExtractorRepository
+import com.example.videodownload.utils.SettingsManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -123,7 +125,10 @@ class AndroidVideoDownloader(private val context: Context) {
             val tempVideoFile = File(cacheDir, "temp_video_${System.currentTimeMillis()}.mp4")
             val tempAudioFile = File(cacheDir, "temp_audio_${System.currentTimeMillis()}.m4a")
 
-            val moviesDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES), "VideoDownload")
+            val moviesDir = File(
+                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES),
+                SettingsManager.getDownloadSubfolder(context)
+            )
             if (!moviesDir.exists()) moviesDir.mkdirs()
 
             val finalFile = File(moviesDir, "${videoInfo.platform.name.lowercase()}_${cleanTitle}_${System.currentTimeMillis()}.mp4")
@@ -409,7 +414,7 @@ class AndroidVideoDownloader(private val context: Context) {
             request.setMimeType(mime)
             request.setDestinationInExternalPublicDir(
                 Environment.DIRECTORY_PICTURES,
-                "VideoDownload/$fileName"
+                "${SettingsManager.getDownloadSubfolder(context)}/$fileName"
             )
             val downloadId = downloadManager.enqueue(request)
             Log.i(TAG, "[downloadMedia] Imagen encolada en Pictures/VideoDownload/$fileName | ID: $downloadId")
@@ -426,9 +431,9 @@ class AndroidVideoDownloader(private val context: Context) {
             request.setMimeType(mime)
             request.setDestinationInExternalPublicDir(
                 Environment.DIRECTORY_MUSIC,
-                "VideoDownload/$fileName"
+                "${SettingsManager.getDownloadSubfolder(context)}/$fileName"
             )
-            Log.d(TAG, "[downloadMedia] Ruta destino Audio (Music/VideoDownload/$fileName) | MIME=$mime")
+            Log.d(TAG, "[downloadMedia] Ruta destino Audio (Music/${SettingsManager.getDownloadSubfolder(context)}/$fileName) | MIME=$mime")
         } else {
             val mime = when (ext) {
                 "webm" -> "video/webm"
@@ -437,9 +442,9 @@ class AndroidVideoDownloader(private val context: Context) {
             request.setMimeType(mime)
             request.setDestinationInExternalPublicDir(
                 Environment.DIRECTORY_MOVIES,
-                "VideoDownload/$fileName"
+                "${SettingsManager.getDownloadSubfolder(context)}/$fileName"
             )
-            Log.d(TAG, "[downloadMedia] Ruta destino Video (Movies/VideoDownload/$fileName) | MIME=$mime")
+            Log.d(TAG, "[downloadMedia] Ruta destino Video (Movies/${SettingsManager.getDownloadSubfolder(context)}/$fileName) | MIME=$mime")
         }
 
         val downloadId = downloadManager.enqueue(request)
@@ -447,8 +452,182 @@ class AndroidVideoDownloader(private val context: Context) {
         return downloadId
     }
 
-    fun getDownloadStatus(downloadId: Long): Pair<Int, Int> {
-        val query = DownloadManager.Query().setFilterById(downloadId)
+    // ====================================================================
+    // DESCARGA A CARPETA PERSONALIZADA (SAF)
+    // ====================================================================
+
+    /**
+     * Descarga el medio directamente en la carpeta (y almacenamiento) que el
+     * usuario eligió con el selector del sistema. Devuelve la Uri del documento
+     * creado. Soporta descargas DASH (video+audio por separado) usando los
+     * mismos archivos temporales y muxer que la ruta clásica.
+     */
+    suspend fun downloadMediaSaf(
+        videoInfo: VideoInfo,
+        selectedOption: DownloadOption? = null,
+        onProgress: ((progress: Int, statusMsg: String) -> Unit)? = null
+    ): Uri = withContext(Dispatchers.IO) {
+        val option = selectedOption ?: DownloadOption(
+            label = "HD MP4",
+            downloadUrl = videoInfo.downloadUrl,
+            isAudio = false,
+            quality = videoInfo.quality,
+            extension = "mp4"
+        )
+
+        val treeUri = SettingsManager.getDownloadTreeUri(context)
+            ?: throw Exception("No hay carpeta de descargas configurada")
+
+        val cleanTitle = videoInfo.title.replace("[^a-zA-Z0-9_ -]".toRegex(), "_")
+            .take(40)
+            .ifEmpty { "media_${System.currentTimeMillis()}" }
+
+        val ext = option.extension.lowercase().ifEmpty { if (option.isAudio) "m4a" else "mp4" }
+        val fileName = "${videoInfo.platform.name.lowercase()}_${cleanTitle}_${System.currentTimeMillis()}.$ext"
+        val mime = when {
+            ext == "jpg" || ext == "jpeg" || ext == "png" || ext == "webp" -> "image/jpeg"
+            option.isAudio || ext == "mp3" || ext == "m4a" -> "audio/mpeg"
+            else -> "video/mp4"
+        }
+
+        // DASH: video y audio por separado -> descargar temp -> muxer -> copiar
+        if (!option.isAudio && !option.audioDownloadUrl.isNullOrBlank()) {
+            Log.d(TAG, "[downloadMediaSaf] Descarga DASH hacia carpeta personalizada")
+
+            val tempVideoFile = File(context.cacheDir, "temp_video_${System.currentTimeMillis()}.mp4")
+            val tempAudioFile = File(context.cacheDir, "temp_audio_${System.currentTimeMillis()}.m4a")
+            val tempFinalFile = File(context.cacheDir, "final_${System.currentTimeMillis()}.mp4")
+
+            try {
+                onProgress?.invoke(5, "Iniciando descarga de video HD...")
+                downloadFileChunked(
+                    videoInfo = videoInfo,
+                    rawUrl = option.downloadUrl,
+                    targetFile = tempVideoFile,
+                    label = "${option.label} (Video)",
+                    baseProgress = 5,
+                    maxProgressRange = 45,
+                    onProgress = onProgress
+                )
+
+                onProgress?.invoke(50, "Iniciando descarga de pista de audio...")
+                downloadFileChunked(
+                    videoInfo = videoInfo,
+                    rawUrl = option.audioDownloadUrl,
+                    targetFile = tempAudioFile,
+                    label = "${option.label} (Audio)",
+                    baseProgress = 50,
+                    maxProgressRange = 35,
+                    onProgress = onProgress
+                )
+
+                onProgress?.invoke(88, "Unificando video y audio...")
+                val muxed = AudioVideoMuxer.mux(tempVideoFile, tempAudioFile, tempFinalFile, option.label)
+                if (!muxed || !validateDownloadedVideo(tempFinalFile)) {
+                    throw Exception("El video descargado es inválido o no contiene datos de video.")
+                }
+
+                onProgress?.invoke(92, "Guardando en la carpeta elegida...")
+                val docUri = copyFileToTree(treeUri, tempFinalFile, fileName, "video/mp4")
+
+                onProgress?.invoke(100, "¡Descarga completada!")
+                return@withContext docUri
+            } finally {
+                tempVideoFile.delete()
+                tempAudioFile.delete()
+                tempFinalFile.delete()
+            }
+        }
+
+        // Descarga directa de un solo stream
+        onProgress?.invoke(5, "Iniciando descarga...")
+        val docUri = createDocumentInTree(treeUri, fileName, mime)
+
+        val (referer, origin) = getPlatformHeaders(videoInfo.platform)
+
+        val request = Request.Builder()
+            .url(option.downloadUrl)
+            .addHeader("User-Agent", USER_AGENT)
+            .addHeader("Accept-Language", "es-ES,es;q=0.9,en-US;q=0.8,en;q=0.7")
+            .addHeader("Referer", referer)
+            .addHeader("Origin", origin)
+            .get()
+            .build()
+
+        try {
+            httpClient.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    throw Exception("HTTP ${response.code} al descargar el archivo")
+                }
+
+                val total = response.header("Content-Length")?.toLongOrNull() ?: -1L
+                var written = 0L
+                var lastReported = 5
+
+                context.contentResolver.openOutputStream(docUri, "w")?.use { output ->
+                    response.body?.byteStream()?.use { input ->
+                        val buffer = ByteArray(64 * 1024)
+                        var read: Int
+                        while (input.read(buffer).also { read = it } != -1) {
+                            output.write(buffer, 0, read)
+                            written += read
+
+                            if (total > 0) {
+                                val pct = ((written * 100L) / total).toInt().coerceIn(5, 99)
+                                if (pct > lastReported) {
+                                    lastReported = pct
+                                    onProgress?.invoke(
+                                        pct,
+                                        "Descargando ${option.label}: ${written / (1024 * 1024)} MB de ${total / (1024 * 1024)} MB"
+                                    )
+                                }
+                            }
+                        }
+                        output.flush()
+                    }
+                } ?: throw Exception("No se pudo abrir la carpeta de destino")
+
+                if (written < 50_000L) {
+                    throw Exception("El archivo descargado es inválido o está vacío")
+                }
+
+                onProgress?.invoke(100, "¡Descarga completada!")
+                Log.i(TAG, "[downloadMediaSaf] Archivo guardado en carpeta personalizada: $fileName ($written bytes)")
+                return@withContext docUri
+            }
+        } catch (e: Exception) {
+            // Limpieza: no dejar documentos a medio escribir
+            try { DocumentsContract.deleteDocument(context.contentResolver, docUri) } catch (_: Exception) {}
+            throw Exception("Error descargando a la carpeta elegida: ${e.localizedMessage}")
+        }
+    }
+
+    /** Crea un documento vacío en el árbol elegido y devuelve su Uri. */
+    private fun createDocumentInTree(treeUri: Uri, fileName: String, mime: String): Uri {
+        val docId = DocumentsContract.getTreeDocumentId(treeUri)
+        val parentDir = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
+        return DocumentsContract.createDocument(context.contentResolver, parentDir, mime, fileName)
+            ?: throw Exception("No se pudo crear el archivo en la carpeta elegida")
+    }
+
+    /** Copia un archivo local al árbol SAF elegido y devuelve la Uri del documento. */
+    private fun copyFileToTree(treeUri: Uri, localFile: File, fileName: String, mime: String): Uri {
+        val docUri = createDocumentInTree(treeUri, fileName, mime)
+        try {
+            context.contentResolver.openOutputStream(docUri, "w")?.use { output ->
+                localFile.inputStream().use { input ->
+                    input.copyTo(output, 64 * 1024)
+                }
+                output.flush()
+            } ?: throw Exception("No se pudo abrir la carpeta de destino")
+        } catch (e: Exception) {
+            try { DocumentsContract.deleteDocument(context.contentResolver, docUri) } catch (_: Exception) {}
+            throw e
+        }
+        return docUri
+    }
+
+    fun getDownloadStatus(downloadId: Long): Pair<Int, Int> {        val query = DownloadManager.Query().setFilterById(downloadId)
         val cursor = downloadManager.query(query)
         if (cursor != null && cursor.moveToFirst()) {
             val statusIndex = cursor.getColumnIndex(DownloadManager.COLUMN_STATUS)

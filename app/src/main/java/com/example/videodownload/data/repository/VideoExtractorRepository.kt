@@ -79,7 +79,6 @@ class VideoExtractorRepository(private val context: Context) {
         listOf(
             TikTokExtractor(client),
             TwitterExtractor(client, context),
-            InstagramExtractor(client, context),
             FacebookExtractor(client, context),
             YouTubeExtractor(client, context)
         )
@@ -104,6 +103,16 @@ class VideoExtractorRepository(private val context: Context) {
         Log.d(TAG, "==================================================")
         Log.d(TAG, "[extractVideoInfo] URL Recibida: '$rawUrl'")
         Log.d(TAG, "[extractVideoInfo] URL Procesada: '$firstUrl' | Plataforma Detectada: ${platform.displayName}")
+
+        // Instagram ya no está soportado: mensaje claro en vez de fallar genérico
+        val firstLower = firstUrl.lowercase()
+        if (firstLower.contains("instagram.com") ||
+            firstLower.contains("instagr.am")
+        ) {
+            return@withContext Result.failure(
+                Exception("Instagram ya no es compatible. Prueba con TikTok, YouTube, Facebook o Twitter/X.")
+            )
+        }
 
         val targetExtractor = extractors.find { it.canHandle(firstUrl) }
 

@@ -8,12 +8,16 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import com.example.videodownload.ui.HomeScreen
 import com.example.videodownload.ui.MainViewModel
 import com.example.videodownload.ui.SplashScreen
 import com.example.videodownload.ui.theme.VideoDownloadTheme
+import com.example.videodownload.utils.SettingsManager
 
 class MainActivity : ComponentActivity() {
 
@@ -27,7 +31,18 @@ class MainActivity : ComponentActivity() {
         handleIncomingIntent(intent)
 
         setContent {
-            VideoDownloadTheme {
+            // Modo de tema persistido: system / dark / light
+            var themeMode by remember {
+                mutableStateOf(SettingsManager.getThemeMode(this))
+            }
+
+            val darkTheme = when (themeMode) {
+                SettingsManager.THEME_DARK -> true
+                SettingsManager.THEME_LIGHT -> false
+                else -> isSystemInDarkTheme()
+            }
+
+            VideoDownloadTheme(darkTheme = darkTheme) {
                 val showSplash = remember { mutableStateOf(true) }
 
                 Crossfade(
@@ -40,7 +55,14 @@ class MainActivity : ComponentActivity() {
                             onSplashFinished = { showSplash.value = false }
                         )
                     } else {
-                        HomeScreen(viewModel = viewModel)
+                        HomeScreen(
+                            viewModel = viewModel,
+                            themeMode = themeMode,
+                            onThemeChange = { mode ->
+                                themeMode = mode
+                                SettingsManager.setThemeMode(this, mode)
+                            }
+                        )
                     }
                 }
             }

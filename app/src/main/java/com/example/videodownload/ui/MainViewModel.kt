@@ -6,6 +6,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.net.Uri
 import android.provider.MediaStore
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.videodownload.data.model.DownloadOption
@@ -16,6 +17,7 @@ import com.example.videodownload.data.model.Platform
 import com.example.videodownload.data.model.VideoInfo
 import com.example.videodownload.data.repository.VideoExtractorRepository
 import com.example.videodownload.downloader.AndroidVideoDownloader
+import com.example.videodownload.utils.SettingsManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -78,7 +80,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         MediaStore.MediaColumns.DATE_ADDED
                     ),
                     "${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?",
-                    arrayOf("%VideoDownload%"),
+                    arrayOf("%${SettingsManager.getDownloadSubfolder(app)}%"),
                     "${MediaStore.MediaColumns.DATE_ADDED} DESC"
                 )?.use { cursor ->
                     val idIdx = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
@@ -108,6 +110,64 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         files.sortedByDescending { it.dateAdded }
+
+        // Sumar archivos de la carpeta personalizada (SAF) si hay una configurada
+        val treeUri = SettingsManager.getDownloadTreeUri(app)
+        if (treeUri != null) {
+            try {
+                val docId = android.provider.DocumentsContract.getTreeDocumentId(treeUri)
+                val childrenUri = android.provider.DocumentsContract
+                    .buildChildDocumentsUriUsingTree(treeUri, docId)
+
+                app.contentResolver.query(
+                    childrenUri,
+                    arrayOf(
+                        android.provider.DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                        android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                        android.provider.DocumentsContract.Document.COLUMN_MIME_TYPE,
+                        android.provider.DocumentsContract.Document.COLUMN_SIZE,
+                        android.provider.DocumentsContract.Document.COLUMN_LAST_MODIFIED
+                    ),
+                    null, null, null
+                )?.use { cursor ->
+                    while (cursor.moveToNext()) {
+                        val docIdCol = cursor.getString(0) ?: continue
+                        val name = cursor.getString(1) ?: continue
+                        val mime = cursor.getString(2) ?: continue
+                        val size = cursor.getLong(3)
+                        val lastMod = cursor.getLong(4)
+
+                        // Solo archivos multimedia (ignora directorios y otros)
+                        val isMedia = mime.startsWith("video/") ||
+                                mime.startsWith("audio/") ||
+                                mime.startsWith("image/")
+                        if (!isMedia || name.startsWith(".")) continue
+
+                        val docUri = android.provider.DocumentsContract
+                            .buildDocumentUriUsingTree(treeUri, docIdCol)
+
+                        files.add(
+                            LocalMediaFile(
+                                name = name,
+                                path = name,
+                                mimeType = mime,
+                                sizeBytes = size,
+                                dateAdded = lastMod / 1000,
+                                contentUri = docUri.toString()
+                            )
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w("MainViewModel", "No se pudo leer la carpeta personalizada: ${e.message}")
+            }
+        }
+
+        // Deduplicar por nombre (por si MediaStore también indexó la carpeta SAF)
+        val seen = mutableSetOf<String>()
+        files
+            .sortedByDescending { it.dateAdded }
+            .filter { seen.add(it.name) }
     }
 
     fun onUrlInputChanged(newUrl: String) {
@@ -163,6 +223,38 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             try {
                 val label = option?.label ?: videoInfo.quality
+
+                // Carpeta personalizada (SAF): descarga manual con progreso,
+                // guardando directamente en el almacenamiento elegido.
+                if (SettingsManager.getDownloadTreeUri(getApplication()) != null) {
+                    _uiState.value = DownloadUiState.Downloading(2, "Iniciando descarga...")
+                    try {
+                        downloader.downloadMediaSaf(videoInfo, option) { progressPercent, statusMsg ->
+                            _uiState.value = DownloadUiState.Downloading(
+                                progress = progressPercent,
+                                title = statusMsg
+                            )
+                        }
+
+                        _uiState.value = DownloadUiState.Success(
+                            videoInfo = videoInfo,
+                            filePath = "Carpeta personalizada"
+                        )
+
+                        val newItem = DownloadedItem(
+                            id = videoInfo.id,
+                            title = "${videoInfo.title} [${label}]",
+                            platform = videoInfo.platform,
+                            localUri = option?.downloadUrl ?: videoInfo.downloadUrl
+                        )
+                        _historyList.value = listOf(newItem) + _historyList.value
+                        refreshDownloadedFiles()
+                    } catch (e: Exception) {
+                        _uiState.value = DownloadUiState.Error("Error descargando: ${e.localizedMessage}")
+                    }
+                    return@launch
+                }
+
                 _uiState.value = DownloadUiState.Downloading(2, "Iniciando descarga...")
 
                 if (option?.audioDownloadUrl != null && !option.isAudio) {
@@ -173,7 +265,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         )
                     }
 
-                    val path = "Movies/VideoDownload/"
+                    val path = "Movies/${SettingsManager.getDownloadSubfolder(getApplication())}/"
                     _uiState.value = DownloadUiState.Success(
                         videoInfo = videoInfo,
                         filePath = path
@@ -202,10 +294,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             isComplete = true
                             val imageExt = setOf("jpg", "jpeg", "png", "webp")
                             val optExt = option?.extension?.lowercase()
+                            val sub = SettingsManager.getDownloadSubfolder(getApplication())
                             val path = when {
-                                optExt != null && optExt in imageExt -> "Pictures/VideoDownload/"
-                                option?.isAudio == true -> "Music/VideoDownload/"
-                                else -> "Movies/VideoDownload/"
+                                optExt != null && optExt in imageExt -> "Pictures/$sub/"
+                                option?.isAudio == true -> "Music/$sub/"
+                                else -> "Movies/$sub/"
                             }
                             _uiState.value = DownloadUiState.Success(
                                 videoInfo = videoInfo,

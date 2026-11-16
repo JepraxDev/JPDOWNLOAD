@@ -1,5 +1,6 @@
 package com.example.videodownload.ui
 
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.Image
@@ -43,7 +44,11 @@ import android.widget.VideoView
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun HomeScreen(viewModel: MainViewModel) {
+fun HomeScreen(
+    viewModel: MainViewModel,
+    themeMode: String = com.example.videodownload.utils.SettingsManager.THEME_SYSTEM,
+    onThemeChange: (String) -> Unit = {}
+) {
     val urlInput by viewModel.urlInput.collectAsState()
     val uiState by viewModel.uiState.collectAsState()
     val detectedPlatform by viewModel.detectedPlatform.collectAsState()
@@ -54,19 +59,8 @@ fun HomeScreen(viewModel: MainViewModel) {
     // Archivo que se está reproduciendo actualmente (null = cerrado)
     var playingFile by remember { mutableStateOf<LocalMediaFile?>(null) }
 
-    // Estado de sesión de Instagram (cookies guardadas)
-    var igLoggedIn by remember { mutableStateOf(InstagramCookieManager.hasCookies(context)) }
-    var showIgLogin by remember { mutableStateOf(false) }
-
-    if (showIgLogin) {
-        InstagramLoginDialog(
-            onDismiss = { showIgLogin = false },
-            onSuccessLogin = {
-                showIgLogin = false
-                igLoggedIn = true
-            }
-        )
-    }
+    // Ajustes
+    var showSettings by remember { mutableStateOf(false) }
 
     Scaffold(
         topBar = {
@@ -88,6 +82,14 @@ fun HomeScreen(viewModel: MainViewModel) {
                             fontWeight = FontWeight.ExtraBold,
                             fontSize = 20.sp,
                             letterSpacing = 1.sp
+                        )
+                    }
+                },
+                actions = {
+                    IconButton(onClick = { showSettings = true }) {
+                        Icon(
+                            imageVector = Icons.Default.Settings,
+                            contentDescription = "Ajustes"
                         )
                     }
                 },
@@ -128,7 +130,6 @@ fun HomeScreen(viewModel: MainViewModel) {
                         ) {
                             PlatformChip("TikTok", Color(0xFF000000))
                             PlatformChip("YouTube", Color(0xFFFF0000))
-                            PlatformChip("Instagram", Color(0xFFE1306C))
                             PlatformChip("Facebook", Color(0xFF1877F2))
                             PlatformChip("Twitter/X", Color(0xFF1DA1F2))
                         }
@@ -205,16 +206,6 @@ fun HomeScreen(viewModel: MainViewModel) {
                         Text(text = "Plataforma detectada:", fontSize = 12.sp)
                         PlatformBadge(platform = detectedPlatform)
                     }
-                }
-            }
-
-            // Instagram exige sesión: ofrecer login si no hay cookies guardadas
-            if (detectedPlatform == Platform.INSTAGRAM && !igLoggedIn) {
-                item {
-                    InstagramLoginPromptCard(
-                        onLoginClick = { showIgLogin = true },
-                        onLoginSuccess = { igLoggedIn = true }
-                    )
                 }
             }
 
@@ -441,54 +432,195 @@ fun HomeScreen(viewModel: MainViewModel) {
             onDismiss = { playingFile = null }
         )
     }
+
+    // Diálogo de ajustes
+    if (showSettings) {
+        SettingsDialog(
+            themeMode = themeMode,
+            onThemeChange = onThemeChange,
+            onDownloadsChanged = { viewModel.refreshDownloadedFiles() },
+            onDismiss = { showSettings = false }
+        )
+    }
 }
 
+/**
+ * Diálogo de Ajustes: modo de tema (sistema / oscuro / claro) y
+ * carpeta de descargas.
+ */
 @Composable
-fun InstagramLoginPromptCard(
-    onLoginClick: () -> Unit,
-    onLoginSuccess: () -> Unit
+fun SettingsDialog(
+    themeMode: String,
+    onThemeChange: (String) -> Unit,
+    onDownloadsChanged: () -> Unit = {},
+    onDismiss: () -> Unit
 ) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(14.dp),
-        colors = CardDefaults.cardColors(
-            containerColor = Color(0xFF2A1B2E)
+    val context = LocalContext.current
+    val prefs = remember { com.example.videodownload.utils.SettingsManager }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = androidx.compose.ui.window.DialogProperties(
+            usePlatformDefaultWidth = true
         )
     ) {
-        Column(
-            modifier = Modifier.padding(14.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
+        Surface(
+            shape = RoundedCornerShape(20.dp),
+            color = MaterialTheme.colorScheme.surface
         ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
             ) {
-                Icon(
-                    imageVector = Icons.Default.Lock,
-                    contentDescription = null,
-                    tint = Color(0xFFE1306C),
-                    modifier = Modifier.size(18.dp)
-                )
+                // Título
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Settings,
+                        contentDescription = null
+                    )
+                    Text(
+                        text = "Ajustes",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 18.sp
+                    )
+                }
+
+                // ---------------------- TEMA ----------------------
                 Text(
-                    text = "Instagram requiere tu sesión",
+                    text = "Apariencia",
                     fontWeight = FontWeight.Bold,
-                    fontSize = 14.sp
+                    fontSize = 14.sp,
+                    color = MaterialTheme.colorScheme.primary
                 )
-            }
-            Text(
-                text = "Inicia sesión una vez en Instagram dentro de la app para poder extraer los Reels. Tus cookies se quedan solo en tu celular.",
-                fontSize = 12.sp,
-                color = Color(0xFFC9B8CE)
-            )
-            Button(
-                onClick = onLoginClick,
-                shape = RoundedCornerShape(10.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = Color(0xFFE1306C)
-                ),
-                modifier = Modifier.align(Alignment.End)
-            ) {
-                Text("Iniciar Sesión", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+
+                listOf(
+                    prefs.THEME_SYSTEM to "Igual que el sistema",
+                    prefs.THEME_DARK to "Modo oscuro",
+                    prefs.THEME_LIGHT to "Modo claro"
+                ).forEach { (mode, label) ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onThemeChange(mode) }
+                            .padding(vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        RadioButton(
+                            selected = themeMode == mode,
+                            onClick = { onThemeChange(mode) }
+                        )
+                        Text(text = label, fontSize = 15.sp)
+                    }
+                }
+
+                HorizontalDivider()
+
+                // ------------------ CARPETA DESCARGAS ------------------
+                Text(
+                    text = "Carpeta de descargas",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 14.sp,
+                    color = MaterialTheme.colorScheme.primary
+                )
+
+                // Selector nativo de carpetas del sistema (SAF):
+                // permite elegir cualquier carpeta y en qué almacenamiento
+                // (memoria interna, tarjeta SD, etc.)
+                val folderPicker = rememberLauncherForActivityResult(
+                    androidx.activity.result.contract.ActivityResultContracts.OpenDocumentTree()
+                ) { uri ->
+                    if (uri != null) {
+                        try {
+                            context.contentResolver.takePersistableUriPermission(
+                                uri,
+                                android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                                        android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                            )
+                        } catch (_: Exception) {
+                            // Algunos proveedores no lo soportan; seguir igual
+                        }
+                        prefs.setDownloadTreeUri(context, uri)
+                        onDownloadsChanged()
+                    }
+                }
+
+                val treeUri = prefs.getDownloadTreeUri(context)
+                val folderLabel = if (treeUri != null) {
+                    try {
+                        val docId = android.provider.DocumentsContract.getTreeDocumentId(treeUri)
+                        val path = docId.substringAfter(':', docId)
+                        if (path.isBlank()) "Almacenamiento principal" else path
+                    } catch (_: Exception) { "Carpeta personalizada" }
+                } else {
+                    null
+                }
+
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier.padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Text(
+                            text = folderLabel
+                                ?: "Movies/VideoDownload",
+                            fontSize = 13.sp
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                onClick = { folderPicker.launch(null) },
+                                shape = RoundedCornerShape(10.dp)
+                            ) {
+                                Text(
+                                    if (treeUri != null) "Elegir otra carpeta"
+                                    else "Elegir carpeta...",
+                                    fontSize = 13.sp
+                                )
+                            }
+                            if (treeUri != null) {
+                                OutlinedButton(
+                                    onClick = {
+                                        prefs.setDownloadTreeUri(context, null)
+                                        onDownloadsChanged()
+                                    },
+                                    shape = RoundedCornerShape(10.dp)
+                                ) {
+                                    Text("Predeterminada", fontSize = 13.sp)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ---------------------- BOTONES ----------------------
+                val versionName = remember {
+                    try {
+                        context.packageManager
+                            .getPackageInfo(context.packageName, 0).versionName
+                    } catch (_: Exception) { "?" }
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Versión $versionName",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Button(onClick = onDismiss) {
+                        Text("Cerrar")
+                    }
+                }
             }
         }
     }
